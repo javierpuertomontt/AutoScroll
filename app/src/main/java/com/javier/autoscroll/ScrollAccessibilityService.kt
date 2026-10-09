@@ -2,83 +2,156 @@ package com.javier.autoscroll
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
+import android.content.Context
 import android.graphics.Path
 import android.os.Handler
 import android.os.Looper
-import android.view.accessibility.AccessibilityEvent
-import android.view.WindowManager
 import android.util.DisplayMetrics
-import android.content.Context
-import android.graphics.Point
-import android.view.Display
-import android.view.WindowManager as WM
+import android.view.WindowManager
+import android.view.accessibility.AccessibilityEvent
+import android.provider.Settings
+import android.text.TextUtils
 import java.util.concurrent.atomic.AtomicBoolean
 
 class ScrollAccessibilityService : AccessibilityService() {
-    private val handler = Handler(Looper.getMainLooper())
-    private val running = AtomicBoolean(false)
-    private var swipeUp = true
-    private var gesturePending = false
-    private var lastPackage: String? = null
-    private var screenW = 1080
-    private var screenH = 2200
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val scrolling = AtomicBoolean(false)
+    @Volatile private var fingerMovesDown = true
+    @Volatile private var gesturePending = false
+    private var screenWidth = 1080
+    private var screenHeight = 2200
+
+    private val nextSwipe = object : Runnable {
+        override fun run() {
+            performSwipe()
+        }
+    }
 
     override fun onServiceConnected() {
+        super.onServiceConnected()
         instance = this
+        updateScreenSize()
+    }
+
+    private fun updateScreenSize() {
         try {
             val wm = getSystemService(WINDOW_SERVICE) as WindowManager
             val metrics = DisplayMetrics()
             @Suppress("DEPRECATION")
             wm.defaultDisplay.getRealMetrics(metrics)
-            screenW=metrics.widthPixels; screenH=metrics.heightPixels
-        } catch (_: Exception) {}
-    }
-    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        if (event?.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
-            val pkg = event.packageName?.toString()
-            if (!pkg.isNullOrBlank() && pkg != packageName) lastPackage = pkg
+            if (metrics.widthPixels > 0 && metrics.heightPixels > 0) {
+                screenWidth = metrics.widthPixels
+                screenHeight = metrics.heightPixels
+            }
+        } catch (_: Exception) {
+            // Conserva dimensiones de respaldo si el fabricante bloquea la consulta.
         }
     }
-    override fun onInterrupt() { stopScrolling() }
-    override fun onDestroy() { stopScrolling(); if (instance === this) instance=null; super.onDestroy() }
 
-    private fun tick() {
-        if (!running.get()) return
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        // No dependemos de eventos de cambio de ventana para ejecutar los gestos:
+        // algunos firmwares MIUI/HyperOS no los notifican de manera consistente.
+    }
+
+    override fun onInterrupt() {
+        stopScrolling()
+    }
+
+    override fun onDestroy() {
+        stopScrolling()
+        if (instance === this) instance = null
+        super.onDestroy()
+    }
+
+    private fun performSwipe() {
+        if (!scrolling.get()) return
         if (gesturePending) {
-            handler.postDelayed({ tick() }, 50)
+            mainHandler.postDelayed(nextSwipe, RETRY_DELAY_MS)
             return
         }
-        val svc = instance ?: run { stopScrolling(); return }
-        val p = Path()
-        val x = screenW * 0.5f
-        val top = screenH * 0.30f
-        val bottom = screenH * 0.85f
-        p.moveTo(x, if (swipeUp) top else bottom)
-        p.lineTo(x, if (swipeUp) bottom else top)
-        val gesture = GestureDescription.Builder().addStroke(GestureDescription.StrokeDescription(p, 0, 80)).build()
+
+        val x = screenWidth * 0.5f
+        val top = screenHeight * TOP_LIMIT
+        val bottom = screenHeight * BOTTOM_LIMIT
+        val path = Path().apply {
+            moveTo(x, if (fingerMovesDown) top else bottom)
+            lineTo(x, if (fingerMovesDown) bottom else top)
+        }
+        val gesture = GestureDescription.Builder()
+            .addStroke(GestureDescription.StrokeDescription(path, 0, SWIPE_DURATION_MS))
+            .build()
+
         gesturePending = true
-        val accepted = svc.dispatchGesture(gesture, object : GestureResultCallback() {
-            override fun onCompleted(gestureDescription: GestureDescription?) { gesturePending=false }
-            override fun onCancelled(gestureDescription: GestureDescription?) { gesturePending=false }
-        }, handler)
-        if (!accepted) gesturePending=false
-        if (running.get()) handler.postDelayed({ tick() }, 150)
+        val accepted = try {
+            dispatchGesture(gesture, object : GestureResultCallback() {
+                override fun onCompleted(gestureDescription: GestureDescription?) {
+                    gesturePending = false
+                    scheduleNext()
+                }
+
+                override fun onCancelled(gestureDescription: GestureDescription?) {
+                    gesturePending = false
+                    scheduleNext()
+                }
+            }, mainHandler)
+        } catch (_: Exception) {
+            false
+        }
+
+        if (!accepted) {
+            gesturePending = false
+            mainHandler.postDelayed(nextSwipe, RETRY_DELAY_MS)
+        }
+    }
+
+    private fun scheduleNext() {
+        if (scrolling.get()) mainHandler.postDelayed(nextSwipe, SWIPE_INTERVAL_MS)
     }
 
     companion object {
+        private const val TOP_LIMIT = 0.28f
+        private const val BOTTOM_LIMIT = 0.82f
+        private const val SWIPE_DURATION_MS = 110L
+        private const val SWIPE_INTERVAL_MS = 140L
+        private const val RETRY_DELAY_MS = 250L
+
         @Volatile private var instance: ScrollAccessibilityService? = null
-        @Volatile private var active = false
-        fun isConnected() = instance != null
-        fun startScroll(up: Boolean) {
-            val s=instance ?: return
-            s.swipeUp=up
-            active=true
-            if (s.running.compareAndSet(false,true)) s.handler.post { s.tick() }
-            else if (!s.gesturePending) s.handler.post { s.tick() }
+
+        fun isConnected(): Boolean = instance != null
+
+        fun isEnabled(context: Context): Boolean {
+            val expected = context.packageName + "/" + ScrollAccessibilityService::class.java.name
+            val enabled = Settings.Secure.getString(
+                context.contentResolver,
+                Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+            ) ?: return false
+            val splitter = TextUtils.SimpleStringSplitter(':')
+            splitter.setString(enabled)
+            while (splitter.hasNext()) {
+                if (splitter.next().equals(expected, ignoreCase = true)) return true
+            }
+            return false
         }
+
+        fun startScroll(fingerDown: Boolean): Boolean {
+            val service = instance ?: return false
+            service.fingerMovesDown = fingerDown
+            if (service.scrolling.compareAndSet(false, true)) {
+                service.mainHandler.removeCallbacks(service.nextSwipe)
+                service.mainHandler.post(service.nextSwipe)
+            } else if (!service.gesturePending) {
+                service.mainHandler.removeCallbacks(service.nextSwipe)
+                service.mainHandler.post(service.nextSwipe)
+            }
+            return true
+        }
+
         fun stopScrolling() {
-            active=false
-            instance?.let { s -> s.running.set(false); s.handler.removeCallbacksAndMessages(null); s.gesturePending=false }
+            val service = instance ?: return
+            service.scrolling.set(false)
+            service.mainHandler.removeCallbacks(service.nextSwipe)
+            // No se fuerza gesturePending=false: el sistema puede seguir ejecutando
+            // el gesto ya despachado y limpiará el indicador en su callback.
         }
     }
 }
