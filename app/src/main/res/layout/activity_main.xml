@@ -1,0 +1,8 @@
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android" android:layout_width="match_parent" android:layout_height="match_parent" android:orientation="vertical" android:gravity="center" android:padding="28dp" android:background="#F4F7FC">
+ <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="AutoScroll" android:textColor="#17233B" android:textSize="30sp" android:textStyle="bold"/>
+ <TextView android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="12dp" android:gravity="center" android:text="Activa los permisos y abre los controles flotantes sobre la aplicación que quieras desplazar." android:textColor="#526078" android:textSize="16sp"/>
+ <Button android:id="@+id/accessibilityButton" android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="28dp" android:text="1. Activar accesibilidad"/>
+ <Button android:id="@+id/overlayButton" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="2. Permitir mostrar sobre otras apps"/>
+ <Button android:id="@+id/startButton" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Abrir controles flotantes"/>
+ <TextView android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="18dp" android:text="Si cambias la configuración de accesibilidad, desactiva y vuelve a activar AutoScroll en los ajustes del teléfono." android:textColor="#667085" android:textSize="13sp"/>
+</LinearLayout>
