@@ -43,7 +43,11 @@ class ScrollAccessibilityService : AccessibilityService() {
     override fun onDestroy() { stopScrolling(); if (instance === this) instance=null; super.onDestroy() }
 
     private fun tick() {
-        if (!running.get() || gesturePending) return
+        if (!running.get()) return
+        if (gesturePending) {
+            handler.postDelayed({ tick() }, 50)
+            return
+        }
         val svc = instance ?: run { stopScrolling(); return }
         val p = Path()
         val x = screenW * 0.5f
