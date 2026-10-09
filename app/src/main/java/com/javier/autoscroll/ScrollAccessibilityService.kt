@@ -6,11 +6,11 @@ import android.content.Context
 import android.graphics.Path
 import android.os.Handler
 import android.os.Looper
+import android.provider.Settings
+import android.text.TextUtils
 import android.util.DisplayMetrics
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
-import android.provider.Settings
-import android.text.TextUtils
 import java.util.concurrent.atomic.AtomicBoolean
 
 class ScrollAccessibilityService : AccessibilityService() {
@@ -18,12 +18,19 @@ class ScrollAccessibilityService : AccessibilityService() {
     private val scrolling = AtomicBoolean(false)
     @Volatile private var fingerMovesDown = true
     @Volatile private var gesturePending = false
+    @Volatile private var sawScrollEvent = false
     private var screenWidth = 1080
     private var screenHeight = 2200
+    private var swipesInBurst = 0
+    private var stalledBursts = 0
 
     private val nextSwipe = object : Runnable {
+        override fun run() { performSwipe() }
+    }
+
+    private val continueAfterLoad = object : Runnable {
         override fun run() {
-            performSwipe()
+            if (scrolling.get()) performSwipe()
         }
     }
 
@@ -43,19 +50,16 @@ class ScrollAccessibilityService : AccessibilityService() {
                 screenWidth = metrics.widthPixels
                 screenHeight = metrics.heightPixels
             }
-        } catch (_: Exception) {
-            // Conserva dimensiones de respaldo si el fabricante bloquea la consulta.
-        }
+        } catch (_: Exception) {}
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        // No dependemos de eventos de cambio de ventana para ejecutar los gestos:
-        // algunos firmwares MIUI/HyperOS no los notifican de manera consistente.
+        if (event?.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED) {
+            sawScrollEvent = true
+        }
     }
 
-    override fun onInterrupt() {
-        stopScrolling()
-    }
+    override fun onInterrupt() { stopScrolling() }
 
     override fun onDestroy() {
         stopScrolling()
@@ -66,13 +70,14 @@ class ScrollAccessibilityService : AccessibilityService() {
     private fun performSwipe() {
         if (!scrolling.get()) return
         if (gesturePending) {
-            mainHandler.postDelayed(nextSwipe, RETRY_DELAY_MS)
+            mainHandler.postDelayed(nextSwipe, 80L)
             return
         }
 
+        // Faster, longer swipe to cover more of the conversation with each gesture.
         val x = screenWidth * 0.5f
-        val top = screenHeight * TOP_LIMIT
-        val bottom = screenHeight * BOTTOM_LIMIT
+        val top = screenHeight * 0.16f
+        val bottom = screenHeight * 0.88f
         val path = Path().apply {
             moveTo(x, if (fingerMovesDown) top else bottom)
             lineTo(x, if (fingerMovesDown) bottom else top)
@@ -81,49 +86,59 @@ class ScrollAccessibilityService : AccessibilityService() {
             .addStroke(GestureDescription.StrokeDescription(path, 0, SWIPE_DURATION_MS))
             .build()
 
+        sawScrollEvent = false
         gesturePending = true
         val accepted = try {
             dispatchGesture(gesture, object : GestureResultCallback() {
                 override fun onCompleted(gestureDescription: GestureDescription?) {
                     gesturePending = false
-                    scheduleNext()
+                    if (!scrolling.get()) return
+                    swipesInBurst++
+                    if (swipesInBurst >= SWIPES_PER_BURST) {
+                        // Instagram may need a moment to fetch the next batch of old messages.
+                        mainHandler.postDelayed({
+                            if (!scrolling.get()) return@postDelayed
+                            if (!sawScrollEvent) stalledBursts++ else stalledBursts = 0
+                            if (stalledBursts >= MAX_STALLED_BURSTS) {
+                                stopScrolling()
+                                return@postDelayed
+                            }
+                            swipesInBurst = 0
+                            sawScrollEvent = false
+                            performSwipe()
+                        }, LOAD_WAIT_MS)
+                    } else {
+                        mainHandler.postDelayed(nextSwipe, SWIPE_GAP_MS)
+                    }
                 }
 
                 override fun onCancelled(gestureDescription: GestureDescription?) {
                     gesturePending = false
-                    scheduleNext()
+                    if (scrolling.get()) mainHandler.postDelayed(nextSwipe, SWIPE_GAP_MS)
                 }
             }, mainHandler)
-        } catch (_: Exception) {
-            false
-        }
+        } catch (_: Exception) { false }
 
         if (!accepted) {
             gesturePending = false
-            mainHandler.postDelayed(nextSwipe, RETRY_DELAY_MS)
+            mainHandler.postDelayed(nextSwipe, 120L)
         }
     }
 
-    private fun scheduleNext() {
-        if (scrolling.get()) mainHandler.postDelayed(nextSwipe, SWIPE_INTERVAL_MS)
-    }
-
     companion object {
-        private const val TOP_LIMIT = 0.28f
-        private const val BOTTOM_LIMIT = 0.82f
-        private const val SWIPE_DURATION_MS = 110L
-        private const val SWIPE_INTERVAL_MS = 140L
-        private const val RETRY_DELAY_MS = 250L
+        private const val SWIPE_DURATION_MS = 70L
+        private const val SWIPE_GAP_MS = 35L
+        private const val SWIPES_PER_BURST = 4
+        private const val LOAD_WAIT_MS = 550L
+        private const val MAX_STALLED_BURSTS = 5
 
         @Volatile private var instance: ScrollAccessibilityService? = null
-
         fun isConnected(): Boolean = instance != null
 
         fun isEnabled(context: Context): Boolean {
             val expected = context.packageName + "/" + ScrollAccessibilityService::class.java.name
             val enabled = Settings.Secure.getString(
-                context.contentResolver,
-                Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+                context.contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
             ) ?: return false
             val splitter = TextUtils.SimpleStringSplitter(':')
             splitter.setString(enabled)
@@ -137,7 +152,11 @@ class ScrollAccessibilityService : AccessibilityService() {
             val service = instance ?: return false
             service.fingerMovesDown = fingerDown
             if (service.scrolling.compareAndSet(false, true)) {
+                service.swipesInBurst = 0
+                service.stalledBursts = 0
+                service.sawScrollEvent = true
                 service.mainHandler.removeCallbacks(service.nextSwipe)
+                service.mainHandler.removeCallbacks(service.continueAfterLoad)
                 service.mainHandler.post(service.nextSwipe)
             } else if (!service.gesturePending) {
                 service.mainHandler.removeCallbacks(service.nextSwipe)
@@ -150,8 +169,7 @@ class ScrollAccessibilityService : AccessibilityService() {
             val service = instance ?: return
             service.scrolling.set(false)
             service.mainHandler.removeCallbacks(service.nextSwipe)
-            // No se fuerza gesturePending=false: el sistema puede seguir ejecutando
-            // el gesto ya despachado y limpiará el indicador en su callback.
+            service.mainHandler.removeCallbacks(service.continueAfterLoad)
         }
     }
 }
