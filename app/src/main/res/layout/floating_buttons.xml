@@ -2,7 +2,7 @@
     android:id="@+id/panel"
     android:layout_width="wrap_content"
     android:layout_height="wrap_content"
-    android:orientation="horizontal"
+    android:orientation="vertical"
     android:gravity="center"
     android:padding="5dp"
     android:background="#EE18243A"
