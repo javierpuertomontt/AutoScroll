@@ -5,7 +5,7 @@ plugins {
 
 android {
     namespace 'com.javier.autoscroll'
-    compileSdk 35
+    compileSdk 34
 
     defaultConfig {
         // Paquete independiente para evitar el rechazo por firma de instalaciones anteriores.
